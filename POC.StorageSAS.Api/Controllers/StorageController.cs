@@ -1,83 +1,190 @@
-﻿using Microsoft.AspNetCore.Http;
+﻿using Azure;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Azure.Storage.Sas;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Threading.Tasks;
 
 namespace POC.StorageSAS.Api.Controllers
 {
-    public class StorageController : Controller
+    [ApiController]
+    [Route("[controller]")]
+    public class StorageController : ControllerBase
     {
-        // GET: StorageController
-        public ActionResult Index()
+        private readonly ILogger<StorageController> _logger;
+        private readonly BlobServiceClient _blobServiceInternal;
+        private readonly BlobServiceClient _blobServiceExternal;
+        private static readonly DateTimeOffset DefaultStartsOn = DateTimeOffset.UtcNow.AddMinutes(-15);
+        private static readonly DateTimeOffset DefaultEndsOn = DateTimeOffset.UtcNow.AddHours(1);
+
+        public StorageController(ILogger<StorageController> logger)
         {
-            return View();
+            _logger = logger;
+            _blobServiceExternal = new BlobServiceClient("DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;TableEndpoint=http://localhost:10002/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;");
+            _blobServiceInternal = new BlobServiceClient("DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;TableEndpoint=http://localhost:10002/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;");
         }
 
-        // GET: StorageController/Details/5
-        public ActionResult Details(int id)
+        [HttpGet]
+        public async Task<IActionResult> GetFileUri([FromQuery] string blobName, [FromQuery] string internalContainerName, [FromQuery] string internalFileName)
         {
-            return View();
+            /*
+             * Get file content on internal storage
+             */
+            BlobContainerClient internalContainer = _blobServiceInternal.GetBlobContainerClient(internalContainerName);
+            var baseFile = await GetFileFromInternalStorage(internalContainer, internalFileName);
+
+
+            /*
+             * Send file to external storage and get read only sas URI
+             */
+            Uri readOnlySasUri = await SendFileToExternalStorageAndGetUri(blobName, baseFile);
+
+            _logger.LogInformation($"Successful GET File call: {blobName}, Uri: {readOnlySasUri}");
+            return Ok(readOnlySasUri);
         }
 
-        // GET: StorageController/Create
-        public ActionResult Create()
+        private async Task<Uri> SendFileToExternalStorageAndGetUri(string blobName, byte[] blobContent)
         {
-            return View();
-        }
+            string containerName = $"sas-container-{DateTime.UtcNow.Ticks}";
+            const string policyPrefix = "access-policy-";
+            string storeAccessPolicyOwner = policyPrefix + "owner";
+            string storeAccessPolicyReadOnly = policyPrefix + "read-only";
 
-        // POST: StorageController/Create
-        [HttpPost]
-        [ValidateAntiForgeryToken]
-        public ActionResult Create(IFormCollection collection)
-        {
+            /*
+             * Get new conteiner name and create it if nor exists
+             */
+            BlobContainerClient externalContainer = _blobServiceExternal.GetBlobContainerClient(containerName);
             try
             {
-                return RedirectToAction(nameof(Index));
+                externalContainer.CreateIfNotExists();
             }
-            catch
+            catch (RequestFailedException ex)
             {
-                return View();
+                throw new Exception(ex.Message, ex);
             }
-        }
 
-        // GET: StorageController/Edit/5
-        public ActionResult Edit(int id)
-        {
-            return View();
-        }
 
-        // POST: StorageController/Edit/5
-        [HttpPost]
-        [ValidateAntiForgeryToken]
-        public ActionResult Edit(int id, IFormCollection collection)
-        {
+            /*
+             * Create read/write Sas URI to send the file to external storage 
+             */
+            await CreateStoreAccessPolicy(externalContainer, storeAccessPolicyOwner, "racwdl");
+            Uri rwSasUri = GetBlobSasUri(externalContainer, blobName, BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(15), null);
+            BlobClient blob = new(rwSasUri);
+
+
+            /* 
+             * Create operation: Upload a blob with the specified name to the container.
+             * If the blob does not exist, it will be created. If it does exist, it will be overwritten.
+             */
             try
             {
-                return RedirectToAction(nameof(Index));
+                blob.Upload(BinaryData.FromBytes(blobContent));
+                _logger.LogInformation("Create operation succeeded for SAS " + rwSasUri);
             }
-            catch
+            catch (RequestFailedException e)
             {
-                return View();
+                _logger.LogInformation("Create operation failed for SAS " + rwSasUri);
+                _logger.LogInformation("Additional error information: " + e.Message);
             }
+
+            /*
+             * Change access policy on new container read only permissions
+             * Then generate a new Sas key for blob file also with read only permission
+             * "r" means read only
+             */
+
+            await CreateStoreAccessPolicy(externalContainer, storeAccessPolicyReadOnly, "r");
+            Uri readOnlySasUri = GetBlobSasUri(externalContainer, blobName, BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5), null);
+
+            /*
+             * With this link we have restricted access to storage
+             */
+
+            return readOnlySasUri;
         }
 
-        // GET: StorageController/Delete/5
-        public ActionResult Delete(int id)
+        public static async Task<byte[]> GetFileFromInternalStorage(BlobContainerClient container, string fileName)
         {
-            return View();
-        }
-
-        // POST: StorageController/Delete/5
-        [HttpPost]
-        [ValidateAntiForgeryToken]
-        public ActionResult Delete(int id, IFormCollection collection)
-        {
+            /*
+             * Find file on internal storage and return content as byte[]
+             */
+            BlobClient blobFile = container.GetBlobClient(fileName);
             try
             {
-                return RedirectToAction(nameof(Index));
+                var content = await blobFile.DownloadContentAsync();
+                var contentBytes = content.Value.Content.ToArray();
+                return contentBytes;
             }
-            catch
+            catch (Exception ex)
             {
-                return View();
+                throw new Exception("Error getting blob file from internal storage", ex);
             }
+        }
+
+        private static Uri GetBlobSasUri(BlobContainerClient container, string blobName, BlobSasPermissions permissions, DateTimeOffset? expiresOn, DateTimeOffset? startsOn)
+        {
+
+            /*
+             * Get BlobClient and check if can generate User Sas Key
+             * For more details check the link: https://docs.microsoft.com/en-us/rest/api/storageservices/create-service-sas
+             */
+            BlobClient blobClient = container.GetBlobClient(blobName);
+
+            if (!blobClient.CanGenerateSasUri)
+            {
+                throw new RequestFailedException("Error getting SAS Uri!");
+            }
+
+            /*
+             * We set allowed IP addresses for constructing a Shared Access Signature
+             */
+            var ipStart = new IPAddress(01);
+            var ipRange = new SasIPRange(ipStart);
+
+            BlobSasBuilder policy = new()
+            {
+                BlobContainerName = container.Name,
+                BlobName = blobName,
+                Resource = "b",
+                StartsOn = startsOn ?? DefaultStartsOn,
+                ExpiresOn = expiresOn ?? DefaultEndsOn,
+                IPRange = ipRange
+            };
+
+            /*
+             * Set custom input permissions in the policy to get the key with them
+             */
+            //policy;
+            policy.SetPermissions(permissions);
+            Uri sasUri = blobClient.GenerateSasUri(policy);
+            return sasUri;
+        }
+
+        private static async Task CreateStoreAccessPolicy(BlobContainerClient container, string policyName, string rawPermissions)
+        {
+            /*
+             * RawPermissions means type of acces, like "rcw" [read, create, write]  for more details look this link:
+             * https://docs.microsoft.com/en-us/rest/api/storageservices/create-service-sas#permissions-for-a-directory-container-or-blob
+             */
+            IEnumerable<BlobSignedIdentifier> permissionsList = new[]
+            {
+                new BlobSignedIdentifier
+                {
+                    Id = policyName,
+                    AccessPolicy =
+                        new BlobAccessPolicy
+                        {
+                            PolicyStartsOn = DefaultStartsOn,
+                            PolicyExpiresOn =  DefaultEndsOn,
+                            Permissions = rawPermissions
+                        }
+                }
+            };
+            await container.SetAccessPolicyAsync(PublicAccessType.None, permissionsList);
         }
     }
 }
