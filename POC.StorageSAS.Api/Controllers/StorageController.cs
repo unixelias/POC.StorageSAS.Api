@@ -3,6 +3,7 @@ using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Sas;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
@@ -15,17 +16,20 @@ namespace POC.StorageSAS.Api.Controllers
     [Route("[controller]")]
     public class StorageController : ControllerBase
     {
+        private readonly IConfiguration Configuration;
         private readonly ILogger<StorageController> _logger;
         private readonly BlobServiceClient _blobServiceInternal;
         private readonly BlobServiceClient _blobServiceExternal;
         private static readonly DateTimeOffset DefaultStartsOn = DateTimeOffset.UtcNow.AddMinutes(-15);
         private static readonly DateTimeOffset DefaultEndsOn = DateTimeOffset.UtcNow.AddHours(1);
 
-        public StorageController(ILogger<StorageController> logger)
+
+        public StorageController(ILogger<StorageController> logger, IConfiguration configuration)
         {
             _logger = logger;
-            _blobServiceExternal = new BlobServiceClient("DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;TableEndpoint=http://localhost:10002/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;");
-            _blobServiceInternal = new BlobServiceClient("DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;TableEndpoint=http://localhost:10002/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;");
+            Configuration = configuration;
+            _blobServiceExternal = new BlobServiceClient(Configuration["InternalStorageConnectionString"]);
+            _blobServiceInternal = new BlobServiceClient(Configuration["ExternalStorageConnectionString"]);
         }
 
         [HttpGet]
