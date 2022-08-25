@@ -28,8 +28,8 @@ namespace POC.StorageSAS.Api.Controllers
         {
             _logger = logger;
             Configuration = configuration;
-            _blobServiceExternal = new BlobServiceClient(Configuration["InternalStorageConnectionString"]);
-            _blobServiceInternal = new BlobServiceClient(Configuration["ExternalStorageConnectionString"]);
+            _blobServiceExternal = new BlobServiceClient(Configuration["ExternalStorageConnectionString"]);
+            _blobServiceInternal = new BlobServiceClient(Configuration["InternalStorageConnectionString"]);
         }
 
         [HttpGet]
@@ -45,13 +45,13 @@ namespace POC.StorageSAS.Api.Controllers
             /*
              * Send file to external storage and get read only sas URI
              */
-            Uri readOnlySasUri = await SendFileToExternalStorageAndGetUri(blobName, baseFile);
+            Uri readOnlySasUri = await SendFileToExternalStorageAndGetSasUri(blobName, baseFile);
 
             _logger.LogInformation($"Successful GET File call: {blobName}, Uri: {readOnlySasUri}");
             return Ok(readOnlySasUri);
         }
 
-        private async Task<Uri> SendFileToExternalStorageAndGetUri(string blobName, byte[] blobContent)
+        private async Task<Uri> SendFileToExternalStorageAndGetSasUri(string blobName, byte[] blobContent)
         {
             string containerName = $"sas-container-{DateTime.UtcNow.Ticks}";
             const string policyPrefix = "access-policy-";
