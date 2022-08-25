@@ -2,6 +2,7 @@
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Sas;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -12,8 +13,9 @@ using System.Threading.Tasks;
 
 namespace POC.StorageSAS.Api.Controllers
 {
+    [ApiVersion("1.0")]
     [ApiController]
-    [Route("[controller]")]
+    [Route("api/v{version:apiVersion}/[controller]")]
     public class StorageController : ControllerBase
     {
         private readonly IConfiguration Configuration;
@@ -23,7 +25,6 @@ namespace POC.StorageSAS.Api.Controllers
         private static readonly DateTimeOffset DefaultStartsOn = DateTimeOffset.UtcNow.AddMinutes(-15);
         private static readonly DateTimeOffset DefaultEndsOn = DateTimeOffset.UtcNow.AddHours(1);
 
-
         public StorageController(ILogger<StorageController> logger, IConfiguration configuration)
         {
             _logger = logger;
@@ -32,27 +33,68 @@ namespace POC.StorageSAS.Api.Controllers
             _blobServiceInternal = new BlobServiceClient(Configuration["InternalStorageConnectionString"]);
         }
 
-        [HttpGet]
-        public async Task<IActionResult> GetFileUri([FromQuery] string blobName, [FromQuery] string internalContainerName, [FromQuery] string internalFileName)
+        [HttpGet("file/{newFileName}")]
+        [Produces("application/json")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+        [ProducesDefaultResponseType]
+        public async Task<IActionResult> GetFileUri([FromRoute] string newFileName, [FromQuery] string internalContainerName, [FromQuery] string internalFileName)
         {
-            /*
-             * Get file content on internal storage
-             */
-            BlobContainerClient internalContainer = _blobServiceInternal.GetBlobContainerClient(internalContainerName);
-            var baseFile = await GetFileFromInternalStorage(internalContainer, internalFileName);
+            try
+            {
+                /*
+                 * Get file content on internal storage
+                 */
+                var baseFile = await GetFileFromInternalStorage(internalContainerName, internalFileName);
 
+                /*
+                 * Send file to external storage and get read only sas URI
+                 */
+                Uri readOnlySasUri = await SendFileToExternalStorageAndGetSasUri(newFileName, baseFile);
 
-            /*
-             * Send file to external storage and get read only sas URI
-             */
-            Uri readOnlySasUri = await SendFileToExternalStorageAndGetSasUri(blobName, baseFile);
-
-            _logger.LogInformation($"Successful GET File call: {blobName}, Uri: {readOnlySasUri}");
-            return Ok(readOnlySasUri);
+                _logger.LogInformation($"Successful GET File call: {newFileName}, Uri: {readOnlySasUri}");
+                return Ok(readOnlySasUri);
+            }
+            catch (RequestFailedException ex)
+            { 
+                return StatusCode((int)ex.Status, ex.Message);
+            }
         }
 
-        private async Task<Uri> SendFileToExternalStorageAndGetSasUri(string blobName, byte[] blobContent)
+        [HttpDelete("container")]
+        [Produces("application/json")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+        [ProducesDefaultResponseType]
+        public async Task<IActionResult> DeleteContainetAsync([FromQuery] string containerName)
         {
+            /*
+             * Delete container
+             */
+            try
+            {
+                await _blobServiceExternal.DeleteBlobContainerAsync(containerName);
+
+                return Ok();
+            }
+            catch (RequestFailedException ex)
+            {
+                return StatusCode((int)ex.Status, ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode((int)HttpStatusCode.InternalServerError, ex.Message);
+            }
+        }
+
+        private async Task<Uri> SendFileToExternalStorageAndGetSasUri(string newFileName, byte[] blobContent)
+        {
+            /* You can set container name to something that identifies
+             * who an when is getting the file, for excample
+            */
             string containerName = $"sas-container-{DateTime.UtcNow.Ticks}";
             const string policyPrefix = "access-policy-";
             string storeAccessPolicyOwner = policyPrefix + "owner";
@@ -68,55 +110,57 @@ namespace POC.StorageSAS.Api.Controllers
             }
             catch (RequestFailedException ex)
             {
+                _logger.LogError("Create or get container falied" + ex.Message);
                 throw new Exception(ex.Message, ex);
             }
 
-
-            /*
-             * Create read/write Sas URI to send the file to external storage 
-             */
-            await CreateStoreAccessPolicy(externalContainer, storeAccessPolicyOwner, "racwdl");
-            Uri rwSasUri = GetBlobSasUri(externalContainer, blobName, BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(15), null);
-            BlobClient blob = new(rwSasUri);
-
-
-            /* 
-             * Create operation: Upload a blob with the specified name to the container.
-             * If the blob does not exist, it will be created. If it does exist, it will be overwritten.
-             */
             try
             {
+                /*
+                 * Create read/write Sas URI to send the file to external storage
+                 * only valid for 1 minute
+                 */
+                await SetStoreAccessPolicy(externalContainer, storeAccessPolicyOwner, "racwdl");
+                Uri rwSasUri = GetBlobSasUri(externalContainer, newFileName, BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(1), null);
+                BlobClient blob = new(rwSasUri);
+
+                /*
+                 * Create operation: Upload a blob with the specified name to the container.
+                 * If the blob does not exist, it will be created. If it does exist, it will be overwritten.
+                 */
                 blob.Upload(BinaryData.FromBytes(blobContent));
                 _logger.LogInformation("Create operation succeeded for SAS " + rwSasUri);
             }
-            catch (RequestFailedException e)
+            catch (RequestFailedException ex)
             {
-                _logger.LogInformation("Create operation failed for SAS " + rwSasUri);
-                _logger.LogInformation("Additional error information: " + e.Message);
+                _logger.LogError("Create file operation failed " + ex.Message);
+                throw new Exception(ex.Message, ex);
             }
 
             /*
-             * Change access policy on new container read only permissions
+             * Change access policy on new container to read only permissions
              * Then generate a new Sas key for blob file also with read only permission
              * "r" means read only
              */
 
-            await CreateStoreAccessPolicy(externalContainer, storeAccessPolicyReadOnly, "r");
-            Uri readOnlySasUri = GetBlobSasUri(externalContainer, blobName, BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5), null);
+            await SetStoreAccessPolicy(externalContainer, storeAccessPolicyReadOnly, "r");
+            Uri readOnlySasUri = GetBlobSasUri(externalContainer, newFileName, BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddHours(24), null);
 
             /*
-             * With this link we have restricted access to storage
+             * With this link we have direct, but restricted access to the file
              */
 
             return readOnlySasUri;
         }
 
-        public static async Task<byte[]> GetFileFromInternalStorage(BlobContainerClient container, string fileName)
+        private async Task<byte[]> GetFileFromInternalStorage(string internalContainerName, string fileName)
         {
             /*
              * Find file on internal storage and return content as byte[]
              */
-            BlobClient blobFile = container.GetBlobClient(fileName);
+            BlobContainerClient internalContainer = _blobServiceInternal.GetBlobContainerClient(internalContainerName);
+
+            BlobClient blobFile = internalContainer.GetBlobClient(fileName);
             try
             {
                 var content = await blobFile.DownloadContentAsync();
@@ -125,13 +169,13 @@ namespace POC.StorageSAS.Api.Controllers
             }
             catch (Exception ex)
             {
-                throw new Exception("Error getting blob file from internal storage", ex);
+                _logger.LogError("Error getting blob file from internal storage" + ex.Message);             
+                throw ex;
             }
         }
 
         private static Uri GetBlobSasUri(BlobContainerClient container, string blobName, BlobSasPermissions permissions, DateTimeOffset? expiresOn, DateTimeOffset? startsOn)
         {
-
             /*
              * Get BlobClient and check if can generate User Sas Key
              * For more details check the link: https://docs.microsoft.com/en-us/rest/api/storageservices/create-service-sas
@@ -168,7 +212,7 @@ namespace POC.StorageSAS.Api.Controllers
             return sasUri;
         }
 
-        private static async Task CreateStoreAccessPolicy(BlobContainerClient container, string policyName, string rawPermissions)
+        private static async Task SetStoreAccessPolicy(BlobContainerClient container, string policyName, string rawPermissions)
         {
             /*
              * RawPermissions means type of acces, like "rcw" [read, create, write]  for more details look this link:
